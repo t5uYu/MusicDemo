@@ -1,0 +1,75 @@
+{
+  "track": "KRSHK - 说爱你",
+  "display_name": "Krshk   说爱你",
+  "bpm": 160.0,
+  "theme": "romantic, dreamy, sweet",
+  "style_hint": "romantic,sweet,modern",
+  "audio_event": "Play_MusicMountain_DemoSong",
+  "mountain_plan": {
+    "generation_seed": 259666,
+    "mountain_height": 9977,
+    "base_path_radius": 3036,
+    "top_path_radius": 1030,
+    "total_turns": 2.84,
+    "segments_per_turn": 46,
+    "road_width": 649,
+    "outer_slope_width": 647,
+    "inner_wall_height": 884,
+    "elevation_gain_multiplier": 1.44,
+    "max_ramp_pitch_degrees": 22,
+    "visibility_range_meters": 1600,
+    "variation": {
+      "radius": 0.133,
+      "height": 0.05,
+      "road_width": 0.127,
+      "core": 0.169
+    }
+  },
+  "sections": [
+    {
+      "name": "intro",
+      "start": 0.0,
+      "end": 40.44,
+      "mood": "sweet",
+      "energy": 0.572,
+      "terrain": "soft_meadow_spiral",
+      "audio_style": "gentle low-pass, light air, soft bloom"
+    },
+    {
+      "name": "verse",
+      "start": 40.44,
+      "end": 80.89,
+      "mood": "dreamy",
+      "energy": 0.743,
+      "terrain": "cloud_garden_spiral",
+      "audio_style": "shimmer reverb, soft chorus, cloud ambience"
+    },
+    {
+      "name": "chorus",
+      "start": 80.89,
+      "end": 121.33,
+      "mood": "dreamy",
+      "energy": 0.584,
+      "terrain": "cloud_garden_spiral",
+      "audio_style": "shimmer reverb, soft chorus, cloud ambience"
+    },
+    {
+      "name": "bridge",
+      "start": 121.33,
+      "end": 161.77,
+      "mood": "dreamy",
+      "energy": 0.665,
+      "terrain": "cloud_garden_spiral",
+      "audio_style": "shimmer reverb, soft chorus, cloud ambience"
+    },
+    {
+      "name": "final",
+      "start": 161.77,
+      "end": 202.21,
+      "mood": "dreamy",
+      "energy": 0.619,
+      "terrain": "cloud_garden_spiral",
+      "audio_style": "shimmer reverb, soft chorus, cloud ambience"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+# Optional high-quality MIR dependencies.
+# The analyzer can run without these if the input is 16-bit PCM WAV.
+# For mp3/mp4, installing ffmpeg is now preferred over fighting Python package resolution.
+librosa==0.11.0
+numpy<2.3
+soundfile==0.13.1
