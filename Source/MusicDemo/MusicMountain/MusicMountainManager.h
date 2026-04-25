@@ -8,6 +8,8 @@
 
 class UAudioComponent;
 class UMaterialInterface;
+class UPCGGraph;
+class UPCGGraphInterface;
 class USoundBase;
 class UStaticMesh;
 class SWidget;
@@ -23,6 +25,15 @@ struct FMusicMountainRoutePoint
 	float RoadWidthScale = 1.0f;
 	float OuterSlopeScale = 1.0f;
 	int32 SectionIndex = INDEX_NONE;
+};
+
+struct FMusicMountainLyricLine
+{
+	float StartTime = 0.0f;
+	float EndTime = 0.0f;
+	FString Speaker = TEXT("Song");
+	FString Text;
+	FString Mood;
 };
 
 USTRUCT(BlueprintType)
@@ -117,6 +128,21 @@ public:
 	int32 GetMusicSeed() const;
 	float GetMusicBpm() const;
 	bool IsDemoCompleted() const;
+	FString GetCurrentSubtitleSpeaker() const;
+	FString GetCurrentSubtitleText() const;
+	FString GetCurrentSubtitleMood() const;
+	bool HasActiveSubtitle() const;
+	FString GetClientLLMProvider() const;
+	FString GetClientLLMEndpoint() const;
+	FString GetClientLLMModel() const;
+	FString GetClientLLMApiKey() const;
+	void SetClientLLMProvider(const FString& Provider);
+	void SetClientLLMSettings(const FString& Provider, const FString& Endpoint, const FString& Model, const FString& ApiKey);
+	bool SaveClientLLMSettings() const;
+	void RequestClientLLMDirector();
+	FString GetClientLLMStatusText() const;
+	bool IsClientLLMRequestInFlight() const;
+	FString GetLyricsLookupStatusText() const;
 
 protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Music Mountain")
@@ -197,15 +223,37 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Music Mountain|Demo")
 	float FinishDistanceCm = 520.0f;
 
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Music Mountain|PCG")
+	bool bEnablePCGSectionVolumes = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Music Mountain|PCG", meta = (EditCondition = "bEnablePCGSectionVolumes"))
+	TObjectPtr<UPCGGraphInterface> SectionPCGGraph = nullptr;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Music Mountain|PCG", meta = (ClampMin = "0.0", UIMin = "0.0", Units = "cm", EditCondition = "bEnablePCGSectionVolumes"))
+	float PCGSectionBoundsPadding = 900.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Music Mountain|PCG", meta = (ClampMin = "100.0", UIMin = "100.0", Units = "cm", EditCondition = "bEnablePCGSectionVolumes"))
+	float PCGSectionBoundsHeight = 2200.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Music Mountain|PCG Preview")
+	bool bGeneratePCGPreviewDecorations = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Music Mountain|PCG Preview", meta = (ClampMin = "0.2", ClampMax = "3.0", UIMin = "0.2", UIMax = "3.0", EditCondition = "bGeneratePCGPreviewDecorations"))
+	float PCGPreviewDensityMultiplier = 1.0f;
+
 private:
 	bool LoadAnalysis();
 	void BuildFallbackAnalysis();
 	void GenerateSpiralRoutePoints(const FVector& StartLocation, float GroundZ);
 	void SpawnMountainCore(const FVector& MountainCenter, float GroundZ);
 	void GenerateSection(int32 SectionIndex, FMusicMountainSection& Section);
+	void SpawnPCGSectionVolume(int32 SectionIndex, const FMusicMountainSection& Section, const TArray<int32>& PointIndices, float SectionRoadWidth, float SectionOuterSlopeWidth);
+	UPCGGraphInterface* GetOrCreatePCGGraph();
+	void SpawnPCGPreviewDecorations(int32 SectionIndex, const FMusicMountainSection& Section, const TArray<int32>& PointIndices, float SectionRoadWidth, float SectionOuterSlopeWidth);
 	void SpawnPlatform(const FString& Label, const FVector& SurfaceCenter, const FVector& Size, const FLinearColor& Color, const FRotator& Rotation = FRotator::ZeroRotator);
 	void SpawnSlopedBlock(const FString& Label, const FVector& StartSurface, const FVector& EndSurface, float Width, float Thickness, bool bEnableCollision, const FLinearColor& Color);
 	void SpawnDecoration(const FString& Label, const FVector& Location, const FVector& Scale, const FLinearColor& Color);
+	void SpawnPreviewDecoration(const FString& Label, UStaticMesh* Mesh, const FVector& Location, const FVector& Scale, const FLinearColor& Color, const FRotator& Rotation = FRotator::ZeroRotator);
 	void UpdateCurrentSection(const FVector& PawnLocation);
 	void RespawnPlayerAtCheckpoint();
 	void ResetPlayerToStart();
@@ -215,6 +263,15 @@ private:
 	void CompleteDemo();
 	void CreateRuntimeHud();
 	void RemoveRuntimeHud();
+	void LoadClientLLMSettings();
+	FString GetClientLLMSettingsPath() const;
+	FString BuildClientLLMDirectorPrompt() const;
+	bool ApplyClientLLMDirectorJson(const FString& JsonText);
+	bool ApplyDirectorObject(const TSharedPtr<FJsonObject>& DirectorObject);
+	void ApplyDirectorMountainPlan(const TSharedPtr<FJsonObject>& MountainPlan);
+	static bool ExtractJsonObjectString(const FString& RawText, FString& OutJsonText);
+	const FMusicMountainLyricLine* FindCurrentLyricLine() const;
+	float GetMusicPlaybackSeconds() const;
 	void ShowSectionMessage(const FMusicMountainSection& Section);
 	FLinearColor ResolveThemeColor(const FMusicMountainSection& Section) const;
 	FLinearColor ResolveRoadColor(const FMusicMountainSection& Section) const;
@@ -229,6 +286,9 @@ private:
 
 	UPROPERTY()
 	TArray<AActor*> GeneratedActors;
+
+	UPROPERTY()
+	TObjectPtr<UPCGGraph> RuntimePreviewPCGGraph;
 
 	UPROPERTY()
 	UStaticMesh* CubeMesh = nullptr;
@@ -246,10 +306,20 @@ private:
 	USoundBase* ActiveMusic = nullptr;
 
 	TArray<FMusicMountainSection> Sections;
+	TArray<FMusicMountainLyricLine> Lyrics;
 	TArray<FMusicMountainRoutePoint> RoutePoints;
 	FString TrackName = TEXT("demo_song");
 	FString DisplayName = TEXT("Demo Song - Music Mountain");
 	FString AudioAssetPath;
+	FString ClientLLMProvider = TEXT("deepseek");
+	FString ClientLLMEndpoint = TEXT("https://api.deepseek.com/chat/completions");
+	FString ClientLLMModel = TEXT("deepseek-chat");
+	FString ClientLLMApiKey;
+	FString ClientLLMStatusText = TEXT("Client LLM idle.");
+	FString LyricsSourceStatus = TEXT("unknown");
+	FString LyricsSourceName;
+	FString LyricsSourceType;
+	FString LyricsSourceQuery;
 	float Bpm = 128.0f;
 	FString Theme = TEXT("cold, epic, lonely");
 	int32 CurrentSectionIndex = INDEX_NONE;
@@ -264,9 +334,12 @@ private:
 	bool bPreviousTabKeyDown = false;
 	bool bPreviousPauseKeyDown = false;
 	bool bPreviousRestartKeyDown = false;
+	bool bClientLLMRequestInFlight = false;
+	bool bUseLoadedAnalysisForNextGenerate = false;
 	float DemoStartTimeSeconds = 0.0f;
 	float DemoFinishTimeSeconds = 0.0f;
 	float CurrentAltitudeProgress = 0.0f;
+	float MusicPlaybackSeconds = 0.0f;
 	FVector DemoStartLocation = FVector::ZeroVector;
 	FVector SummitLocation = FVector::ZeroVector;
 	TSharedPtr<SWidget> RuntimeHudWidget;

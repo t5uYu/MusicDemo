@@ -7,6 +7,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "MusicMountainDirectorSettings.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Sound/SoundBase.h"
@@ -38,6 +39,8 @@ public:
 	{
 		AudioPathText = FText::GetEmpty();
 		OutputPathText = FText::FromString(FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir() / TEXT("MusicMountain/Data/MusicAnalysisDemo.json")));
+		DirectorPromptPathText = FText::FromString(FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("MusicMountainDirectorPrompt.md")));
+		DirectorJsonPathText = FText::FromString(FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("MusicMountainDirectorPlan.json")));
 
 		ChildSlot
 		[
@@ -220,13 +223,92 @@ public:
 				.AutoHeight()
 				.Padding(0.0f, 18.0f, 0.0f, 0.0f)
 				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("DirectorPromptOutputLabel", "LLM Director Prompt Output"))
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 8.0f, 0.0f, 0.0f)
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.0f)
+					[
+						SAssignNew(DirectorPromptPathBox, SEditableTextBox)
+						.Text(this, &SMusicMountainImportPanel::GetDirectorPromptPathText)
+						.OnTextCommitted(this, &SMusicMountainImportPanel::OnDirectorPromptPathCommitted)
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("UseDefaultPromptOutput", "Use Default"))
+						.OnClicked(this, &SMusicMountainImportPanel::OnUseDefaultDirectorPromptPath)
+					]
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 16.0f, 0.0f, 8.0f)
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("DirectorJsonLabel", "LLM Director JSON"))
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.0f)
+					[
+						SAssignNew(DirectorJsonPathBox, SEditableTextBox)
+						.Text(this, &SMusicMountainImportPanel::GetDirectorJsonPathText)
+						.OnTextCommitted(this, &SMusicMountainImportPanel::OnDirectorJsonPathCommitted)
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("BrowseDirectorJson", "Browse..."))
+						.OnClicked(this, &SMusicMountainImportPanel::OnBrowseDirectorJson)
+					]
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 18.0f, 0.0f, 0.0f)
+				[
 					SNew(SHorizontalBox)
 					+ SHorizontalBox::Slot()
 					.AutoWidth()
+					.Padding(0.0f, 0.0f, 8.0f, 0.0f)
 					[
 						SNew(SButton)
 						.Text(LOCTEXT("Analyze", "Analyze Music"))
 						.OnClicked(this, &SMusicMountainImportPanel::OnAnalyze)
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.Padding(0.0f, 0.0f, 8.0f, 0.0f)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("GenerateDirectorPrompt", "Generate LLM Prompt"))
+						.OnClicked(this, &SMusicMountainImportPanel::OnGenerateDirectorPrompt)
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.Padding(0.0f, 0.0f, 8.0f, 0.0f)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("RunLLMDirector", "Run LLM Director"))
+						.OnClicked(this, &SMusicMountainImportPanel::OnRunLLMDirector)
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("ApplyDirectorJson", "Apply Director JSON"))
+						.OnClicked(this, &SMusicMountainImportPanel::OnApplyDirectorJson)
 					]
 				]
 				+ SVerticalBox::Slot()
@@ -252,8 +334,18 @@ public:
 	}
 
 private:
+	struct FAnalyzerRunResult
+	{
+		int32 ReturnCode = -1;
+		FString Params;
+		FString StdOut;
+		FString StdErr;
+	};
+
 	FText GetAudioPathText() const { return AudioPathText; }
 	FText GetOutputPathText() const { return OutputPathText; }
+	FText GetDirectorPromptPathText() const { return DirectorPromptPathText; }
+	FText GetDirectorJsonPathText() const { return DirectorJsonPathText; }
 	FText GetStatusText() const { return StatusText; }
 
 	void OnAudioPathCommitted(const FText& Text, ETextCommit::Type)
@@ -264,6 +356,16 @@ private:
 	void OnOutputPathCommitted(const FText& Text, ETextCommit::Type)
 	{
 		OutputPathText = Text;
+	}
+
+	void OnDirectorPromptPathCommitted(const FText& Text, ETextCommit::Type)
+	{
+		DirectorPromptPathText = Text;
+	}
+
+	void OnDirectorJsonPathCommitted(const FText& Text, ETextCommit::Type)
+	{
+		DirectorJsonPathText = Text;
 	}
 
 	FReply OnBrowseAudio()
@@ -318,62 +420,286 @@ private:
 		return FReply::Handled();
 	}
 
+	FReply OnUseDefaultDirectorPromptPath()
+	{
+		DirectorPromptPathText = FText::FromString(FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("MusicMountainDirectorPrompt.md")));
+		if (DirectorPromptPathBox.IsValid())
+		{
+			DirectorPromptPathBox->SetText(DirectorPromptPathText);
+		}
+		return FReply::Handled();
+	}
+
+	FReply OnBrowseDirectorJson()
+	{
+		IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
+		if (!DesktopPlatform)
+		{
+			SetStatus(TEXT("DesktopPlatform is unavailable."));
+			return FReply::Handled();
+		}
+
+		void* ParentWindowHandle = nullptr;
+		if (FModuleManager::Get().IsModuleLoaded("MainFrame"))
+		{
+			IMainFrameModule& MainFrameModule = FModuleManager::LoadModuleChecked<IMainFrameModule>("MainFrame");
+			const TSharedPtr<SWindow> ParentWindow = MainFrameModule.GetParentWindow();
+			if (ParentWindow.IsValid() && ParentWindow->GetNativeWindow().IsValid())
+			{
+				ParentWindowHandle = ParentWindow->GetNativeWindow()->GetOSWindowHandle();
+			}
+		}
+
+		TArray<FString> OutFiles;
+		const bool bSelected = DesktopPlatform->OpenFileDialog(
+			ParentWindowHandle,
+			TEXT("Choose Music Mountain Director JSON"),
+			FPaths::ProjectSavedDir(),
+			TEXT(""),
+			TEXT("JSON Files (*.json)|*.json|All Files (*.*)|*.*"),
+			EFileDialogFlags::None,
+			OutFiles);
+
+		if (bSelected && OutFiles.Num() > 0)
+		{
+			DirectorJsonPathText = FText::FromString(OutFiles[0]);
+			if (DirectorJsonPathBox.IsValid())
+			{
+				DirectorJsonPathBox->SetText(DirectorJsonPathText);
+			}
+		}
+
+		return FReply::Handled();
+	}
+
 	FReply OnAnalyze()
 	{
 		const FString AudioPath = AudioPathText.ToString();
 		const FString OutputPath = OutputPathText.ToString();
 		const FString StyleHint = BuildStyleHintString();
+		FString Params;
+		if (!BuildBaseAnalyzerParams(AudioPath, OutputPath, StyleHint, Params))
+		{
+			return FReply::Handled();
+		}
+
+		const FAnalyzerRunResult RunResult = RunAnalyzer(Params);
+
+		FString ImportStatus;
+		if (RunResult.ReturnCode == 0)
+		{
+			ImportStatus = ImportAudioForRuntime(AudioPath, OutputPath);
+		}
+
+		SetStatus(FormatAnalyzerResult(RunResult, ImportStatus));
+		ShowCompletionNotification(RunResult.ReturnCode == 0, LOCTEXT("AnalyzeSuccess", "Music Mountain analysis completed."));
+
+		return FReply::Handled();
+	}
+
+	FReply OnGenerateDirectorPrompt()
+	{
+		const FString AudioPath = AudioPathText.ToString();
+		const FString OutputPath = OutputPathText.ToString();
+		const FString StyleHint = BuildStyleHintString();
+		const FString PromptPath = DirectorPromptPathText.ToString();
+		if (PromptPath.IsEmpty())
+		{
+			SetStatus(TEXT("Director prompt output path is empty."));
+			return FReply::Handled();
+		}
+
+		FString Params;
+		if (!BuildBaseAnalyzerParams(AudioPath, OutputPath, StyleHint, Params))
+		{
+			return FReply::Handled();
+		}
+		Params += FString::Printf(TEXT(" --director-prompt-output \"%s\""), *PromptPath);
+
+		const FAnalyzerRunResult RunResult = RunAnalyzer(Params);
+		SetStatus(FormatAnalyzerResult(RunResult, FString::Printf(TEXT("Director prompt: %s"), *PromptPath)));
+		ShowCompletionNotification(RunResult.ReturnCode == 0, LOCTEXT("DirectorPromptSuccess", "LLM Director prompt generated."));
+
+		return FReply::Handled();
+	}
+
+	FReply OnRunLLMDirector()
+	{
+		const FString AudioPath = AudioPathText.ToString();
+		const FString OutputPath = OutputPathText.ToString();
+		const FString StyleHint = BuildStyleHintString();
+		const FString DirectorJsonPath = DirectorJsonPathText.ToString();
+		if (DirectorJsonPath.IsEmpty())
+		{
+			SetStatus(TEXT("Director JSON output path is empty."));
+			return FReply::Handled();
+		}
+
+		FString Params;
+		if (!BuildBaseAnalyzerParams(AudioPath, OutputPath, StyleHint, Params))
+		{
+			return FReply::Handled();
+		}
+		Params += FString::Printf(TEXT(" --llm-lyrics-query --call-llm-director --director-json-output \"%s\""), *DirectorJsonPath);
+
+		const FAnalyzerRunResult RunResult = RunAnalyzer(Params);
+
+		FString ImportStatus;
+		if (RunResult.ReturnCode == 0)
+		{
+			ImportStatus = ImportAudioForRuntime(AudioPath, OutputPath);
+		}
+
+		SetStatus(FormatAnalyzerResult(RunResult, ImportStatus));
+		ShowCompletionNotification(RunResult.ReturnCode == 0, LOCTEXT("RunDirectorSuccess", "LLM Director completed."));
+
+		return FReply::Handled();
+	}
+
+	FReply OnApplyDirectorJson()
+	{
+		const FString AudioPath = AudioPathText.ToString();
+		const FString OutputPath = OutputPathText.ToString();
+		const FString StyleHint = BuildStyleHintString();
+		const FString DirectorJsonPath = DirectorJsonPathText.ToString();
+		if (DirectorJsonPath.IsEmpty() || !FPaths::FileExists(DirectorJsonPath))
+		{
+			SetStatus(FString::Printf(TEXT("Director JSON does not exist: %s"), *DirectorJsonPath));
+			return FReply::Handled();
+		}
+
+		FString Params;
+		if (!BuildBaseAnalyzerParams(AudioPath, OutputPath, StyleHint, Params))
+		{
+			return FReply::Handled();
+		}
+		Params += FString::Printf(TEXT(" --director-json \"%s\""), *DirectorJsonPath);
+
+		const FAnalyzerRunResult RunResult = RunAnalyzer(Params);
+
+		FString ImportStatus;
+		if (RunResult.ReturnCode == 0)
+		{
+			ImportStatus = ImportAudioForRuntime(AudioPath, OutputPath);
+		}
+
+		SetStatus(FormatAnalyzerResult(RunResult, ImportStatus));
+		ShowCompletionNotification(RunResult.ReturnCode == 0, LOCTEXT("DirectorApplySuccess", "LLM Director JSON applied."));
+
+		return FReply::Handled();
+	}
+
+	bool BuildBaseAnalyzerParams(const FString& AudioPath, const FString& OutputPath, const FString& StyleHint, FString& OutParams)
+	{
 		if (AudioPath.IsEmpty() || !FPaths::FileExists(AudioPath))
 		{
 			SetStatus(FString::Printf(TEXT("Audio file does not exist: %s"), *AudioPath));
-			return FReply::Handled();
+			return false;
+		}
+
+		if (OutputPath.IsEmpty())
+		{
+			SetStatus(TEXT("Output JSON path is empty."));
+			return false;
 		}
 
 		const FString ScriptPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / TEXT("Tools/MusicMountain/analyze_music.py"));
 		if (!FPaths::FileExists(ScriptPath))
 		{
 			SetStatus(FString::Printf(TEXT("Analyzer script does not exist: %s"), *ScriptPath));
-			return FReply::Handled();
+			return false;
 		}
 
-		FString Params = FString::Printf(
-			TEXT("\"%s\" \"%s\" --output \"%s\" --pretty"),
+		OutParams = FString::Printf(
+			TEXT("\"%s\" \"%s\" --output \"%s\" --pretty --lookup-lyrics"),
 			*ScriptPath,
 			*AudioPath,
 			*OutputPath);
 		if (!StyleHint.IsEmpty())
 		{
-			Params += FString::Printf(TEXT(" --style-hint \"%s\""), *StyleHint);
+			OutParams += FString::Printf(TEXT(" --style-hint \"%s\""), *StyleHint);
 		}
 
+		return true;
+	}
+
+	FAnalyzerRunResult RunAnalyzer(const FString& Params)
+	{
+		FAnalyzerRunResult Result;
+		Result.Params = Params;
+		InjectLLMDirectorEnvironment();
 		SetStatus(FString::Printf(TEXT("Running: python %s"), *Params));
+		FPlatformProcess::ExecProcess(TEXT("python"), *Params, &Result.ReturnCode, &Result.StdOut, &Result.StdErr);
+		return Result;
+	}
 
-		int32 ReturnCode = -1;
-		FString StdOut;
-		FString StdErr;
-		FPlatformProcess::ExecProcess(TEXT("python"), *Params, &ReturnCode, &StdOut, &StdErr);
-
-		FString ImportStatus;
-		if (ReturnCode == 0)
+	void InjectLLMDirectorEnvironment() const
+	{
+		const UMusicMountainDirectorSettings* Settings = UMusicMountainDirectorSettings::GetSettings();
+		if (!Settings)
 		{
-			ImportStatus = ImportAudioForRuntime(AudioPath, OutputPath);
+			return;
 		}
 
-		const FString Result = FString::Printf(
-			TEXT("ExitCode: %d\n\n[stdout]\n%s\n\n[stderr]\n%s\n\n[asset import]\n%s"),
-			ReturnCode,
-			*StdOut,
-			*StdErr,
-			*ImportStatus);
-		SetStatus(Result);
+		FString Provider = Settings->Provider;
+		FString EndpointUrl = Settings->EndpointUrl;
+		FString Model = Settings->Model;
+		FString ApiKey = Settings->ApiKey;
+		LoadClientLLMSettingsFallback(Provider, EndpointUrl, Model, ApiKey);
 
-		FNotificationInfo Info(ReturnCode == 0
-			? LOCTEXT("AnalyzeSuccess", "Music Mountain analysis completed.")
-			: LOCTEXT("AnalyzeFailed", "Music Mountain analysis failed. Check the status log."));
+		FPlatformMisc::SetEnvironmentVar(TEXT("MUSIC_MOUNTAIN_LLM_PROVIDER"), *Provider);
+		FPlatformMisc::SetEnvironmentVar(TEXT("MUSIC_MOUNTAIN_LLM_ENDPOINT"), *EndpointUrl);
+		FPlatformMisc::SetEnvironmentVar(TEXT("MUSIC_MOUNTAIN_LLM_MODEL"), *Model);
+		FPlatformMisc::SetEnvironmentVar(TEXT("MUSIC_MOUNTAIN_LLM_API_KEY"), *ApiKey);
+		FPlatformMisc::SetEnvironmentVar(TEXT("MUSIC_MOUNTAIN_LLM_TIMEOUT"), *FString::FromInt(Settings->RequestTimeoutSeconds));
+		FPlatformMisc::SetEnvironmentVar(TEXT("MUSIC_MOUNTAIN_LLM_TEMPERATURE"), *FString::SanitizeFloat(Settings->Temperature));
+	}
+
+	void LoadClientLLMSettingsFallback(FString& Provider, FString& EndpointUrl, FString& Model, FString& ApiKey) const
+	{
+		if (!ApiKey.IsEmpty())
+		{
+			return;
+		}
+
+		const FString SettingsPath = FPaths::ProjectSavedDir() / TEXT("MusicMountainClientLLMSettings.json");
+		FString JsonText;
+		if (!FFileHelper::LoadFileToString(JsonText, *SettingsPath))
+		{
+			return;
+		}
+
+		TSharedPtr<FJsonObject> RootObject;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+		if (!FJsonSerializer::Deserialize(Reader, RootObject) || !RootObject.IsValid())
+		{
+			return;
+		}
+
+		Provider = RootObject->HasTypedField<EJson::String>(TEXT("provider")) ? RootObject->GetStringField(TEXT("provider")) : Provider;
+		EndpointUrl = RootObject->HasTypedField<EJson::String>(TEXT("endpoint")) ? RootObject->GetStringField(TEXT("endpoint")) : EndpointUrl;
+		Model = RootObject->HasTypedField<EJson::String>(TEXT("model")) ? RootObject->GetStringField(TEXT("model")) : Model;
+		ApiKey = RootObject->HasTypedField<EJson::String>(TEXT("api_key")) ? RootObject->GetStringField(TEXT("api_key")) : ApiKey;
+	}
+
+	FString FormatAnalyzerResult(const FAnalyzerRunResult& Result, const FString& ExtraStatus) const
+	{
+		return FString::Printf(
+			TEXT("Command: python %s\n\nExitCode: %d\n\n[stdout]\n%s\n\n[stderr]\n%s\n\n[extra]\n%s"),
+			*Result.Params,
+			Result.ReturnCode,
+			*Result.StdOut,
+			*Result.StdErr,
+			*ExtraStatus);
+	}
+
+	void ShowCompletionNotification(bool bSuccess, const FText& SuccessText) const
+	{
+		FNotificationInfo Info(bSuccess
+			? SuccessText
+			: LOCTEXT("AnalyzerFailed", "Music Mountain tool failed. Check the status log."));
 		Info.ExpireDuration = 5.0f;
 		FSlateNotificationManager::Get().AddNotification(Info);
-
-		return FReply::Handled();
 	}
 
 	FString ImportAudioForRuntime(const FString& AudioPath, const FString& JsonPath) const
@@ -533,9 +859,13 @@ private:
 
 	FText AudioPathText;
 	FText OutputPathText;
+	FText DirectorPromptPathText;
+	FText DirectorJsonPathText;
 	FText StatusText = LOCTEXT("InitialStatus", "Choose an audio file, then click Analyze Music.");
 	TSharedPtr<SEditableTextBox> AudioPathBox;
 	TSharedPtr<SEditableTextBox> OutputPathBox;
+	TSharedPtr<SEditableTextBox> DirectorPromptPathBox;
+	TSharedPtr<SEditableTextBox> DirectorJsonPathBox;
 	TSharedPtr<STextBlock> StatusTextBlock;
 	bool bHintRomantic = false;
 	bool bHintSweet = false;

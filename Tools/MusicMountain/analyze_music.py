@@ -11,12 +11,17 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import re
 import shutil
 import statistics
 import struct
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +31,7 @@ from typing import Any
 DEFAULT_OUTPUT = Path("Content/MusicMountain/Data/MusicAnalysisGenerated.json")
 SECTION_NAMES = ("intro", "verse", "chorus", "bridge", "final")
 DIRECTOR_MERGE_SECTION_FIELDS = ("mood", "energy", "terrain", "audio_style", "visual_motif", "gameplay_intent")
+LRC_LINE_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]\s*(.*)")
 
 
 @dataclass
@@ -450,7 +456,184 @@ def build_mountain_plan(features: AudioFeatures, seed: int, sections: list[dict[
     }
 
 
-def build_music_json(audio_path: Path, features: AudioFeatures, style_hint: str = "") -> dict[str, Any]:
+def parse_artist_title_from_filename(audio_path: Path) -> tuple[str, str]:
+    stem = audio_path.stem.strip()
+    separators = (" - ", " – ", " — ", "-", "–", "—")
+    for separator in separators:
+        if separator in stem:
+            artist, title = stem.split(separator, 1)
+            return artist.strip(), title.strip()
+    return "", stem
+
+
+def lrc_time_to_seconds(minutes: str, seconds: str, fraction: str | None) -> float:
+    value = int(minutes) * 60 + int(seconds)
+    if fraction:
+        if len(fraction) == 1:
+            value += int(fraction) / 10.0
+        elif len(fraction) == 2:
+            value += int(fraction) / 100.0
+        else:
+            value += int(fraction[:3]) / 1000.0
+    return float(value)
+
+
+def parse_synced_lyrics(synced_lyrics: str, duration: float) -> list[dict[str, Any]]:
+    parsed_lines: list[tuple[float, str]] = []
+    for raw_line in synced_lyrics.splitlines():
+        match = LRC_LINE_RE.match(raw_line.strip())
+        if not match:
+            continue
+        text = match.group(4).strip()
+        if not text:
+            continue
+        parsed_lines.append((lrc_time_to_seconds(match.group(1), match.group(2), match.group(3)), text))
+
+    lyrics: list[dict[str, Any]] = []
+    for index, (start, text) in enumerate(parsed_lines):
+        next_start = parsed_lines[index + 1][0] if index + 1 < len(parsed_lines) else min(start + 4.0, duration)
+        end = clamp(next_start - 0.1, start + 1.2, start + 7.0)
+        lyrics.append(
+            {
+                "start": round(start, 2),
+                "end": round(min(end, duration), 2),
+                "speaker": "Lyrics",
+                "text": text,
+                "mood": "",
+            }
+        )
+    return lyrics
+
+
+def plain_lyrics_to_timeline(plain_lyrics: str, duration: float) -> list[dict[str, Any]]:
+    lines = [line.strip() for line in plain_lyrics.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    usable_start = min(8.0, duration * 0.08)
+    usable_duration = max(duration - usable_start, float(len(lines)) * 2.5)
+    step = usable_duration / max(len(lines), 1)
+    lyrics: list[dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        start = usable_start + index * step
+        end = min(start + max(min(step * 0.8, 5.5), 2.0), duration)
+        lyrics.append(
+            {
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "speaker": "Lyrics",
+                "text": line,
+                "mood": "",
+            }
+        )
+    return lyrics
+
+
+def search_lrclib(query_params: dict[str, str], duration: float) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    url = "https://lrclib.net/api/search?" + urllib.parse.urlencode(query_params)
+    request = urllib.request.Request(url, headers={"User-Agent": "MusicMountainDemo/0.1"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            results = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return [], {"status": "failed", "reason": str(exc), "query": query_params}
+
+    if not isinstance(results, list) or not results:
+        return [], {"status": "not_found", "query": query_params}
+
+    best = results[0]
+    synced = best.get("syncedLyrics") or ""
+    plain = best.get("plainLyrics") or ""
+    if synced:
+        lyrics = parse_synced_lyrics(synced, duration)
+        source_type = "synced"
+    else:
+        lyrics = plain_lyrics_to_timeline(plain, duration)
+        source_type = "plain"
+
+    return lyrics, {
+        "status": "found" if lyrics else "empty",
+        "source": "lrclib",
+        "source_type": source_type,
+        "query": query_params,
+        "track": best.get("trackName", ""),
+        "artist": best.get("artistName", ""),
+        "album": best.get("albumName", ""),
+    }
+
+
+def build_direct_filename_lyrics_queries(audio_path: Path) -> list[dict[str, str]]:
+    artist, title = parse_artist_title_from_filename(audio_path)
+    queries: list[dict[str, str]] = []
+    if title and artist:
+        queries.append({"track_name": title, "artist_name": artist})
+    if title:
+        queries.append({"track_name": title})
+    if audio_path.stem:
+        queries.append({"q": audio_path.stem})
+    return queries
+
+
+def build_llm_lyrics_queries(audio_path: Path) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    prompt = (
+        "You help search song lyrics. Return one JSON object only.\n"
+        "Given an audio filename, infer likely artist/title and produce up to 5 LRCLIB search queries.\n"
+        "Use fields q, track_name, artist_name only. Do not invent lyrics.\n"
+        "Schema: {\"queries\":[{\"track_name\":\"...\",\"artist_name\":\"...\"},{\"q\":\"...\"}]}\n"
+        f"Filename: {audio_path.name}\n"
+    )
+    try:
+        result = call_openai_compatible_director(prompt)
+    except Exception as exc:
+        return [], {"llm_query_status": "failed", "llm_query_reason": str(exc)}
+
+    queries: list[dict[str, str]] = []
+    for raw_query in result.get("queries", []):
+        if not isinstance(raw_query, dict):
+            continue
+        query: dict[str, str] = {}
+        for key in ("q", "track_name", "artist_name"):
+            value = raw_query.get(key)
+            if isinstance(value, str) and value.strip():
+                query[key] = value.strip()
+        if query:
+            queries.append(query)
+    return queries, {"llm_query_status": "ok", "llm_queries": queries}
+
+
+def lookup_lrclib_lyrics(audio_path: Path, duration: float, llm_query: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    queries = build_direct_filename_lyrics_queries(audio_path)
+    llm_metadata: dict[str, Any] = {"llm_query_status": "disabled"}
+    if llm_query:
+        llm_queries, llm_metadata = build_llm_lyrics_queries(audio_path)
+        queries = llm_queries + queries
+
+    if not queries:
+        return [], {"status": "skipped", "reason": "empty filename query", **llm_metadata}
+
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    failures: list[dict[str, Any]] = []
+    for query_params in queries:
+        signature = tuple(sorted(query_params.items()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        lyrics, metadata = search_lrclib(query_params, duration)
+        metadata.update(llm_metadata)
+        if lyrics:
+            metadata["attempted_queries"] = queries
+            return lyrics, metadata
+        failures.append(metadata)
+
+    return [], {
+        "status": "not_found",
+        "attempted_queries": queries,
+        "failures": failures[:5],
+        **llm_metadata,
+    }
+
+
+def build_music_json(audio_path: Path, features: AudioFeatures, style_hint: str = "", lookup_lyrics: bool = False, llm_lyrics_query: bool = False) -> dict[str, Any]:
     seed = stable_seed(audio_path)
     sections = build_sections(features, style_hint)
     theme_parts = sorted({section["mood"] for section in sections})
@@ -458,17 +641,25 @@ def build_music_json(audio_path: Path, features: AudioFeatures, style_hint: str 
     if normalized_hint and normalized_hint not in theme_parts:
         theme_parts.insert(0, normalized_hint)
     theme = ", ".join(theme_parts)
+    lyrics: list[dict[str, Any]] = []
+    lyrics_source: dict[str, Any] = {"status": "disabled"}
+    if lookup_lyrics:
+        lyrics, lyrics_source = lookup_lrclib_lyrics(audio_path, features.duration, llm_lyrics_query)
 
-    return {
+    payload = {
         "track": audio_path.stem,
         "display_name": audio_path.stem.replace("_", " ").replace("-", " ").title(),
         "bpm": round(features.bpm, 2),
         "theme": theme,
         "style_hint": style_hint or "",
+        "lyrics_source": lyrics_source,
         "audio_event": "Play_MusicMountain_DemoSong",
         "mountain_plan": build_mountain_plan(features, seed, sections, style_hint),
         "sections": sections,
     }
+    if lyrics:
+        payload["lyrics"] = lyrics
+    return payload
 
 
 def read_optional_text(path: Path | None) -> str:
@@ -601,14 +792,109 @@ def merge_director_plan(payload: dict[str, Any], director_plan: dict[str, Any]) 
     return merged
 
 
+def extract_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise RuntimeError("LLM response did not contain a JSON object")
+
+    parsed = json.loads(stripped[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise RuntimeError("LLM response JSON was not an object")
+    return parsed
+
+
+def call_openai_compatible_director(prompt: str) -> dict[str, Any]:
+    api_key = os.environ.get("MUSIC_MOUNTAIN_LLM_API_KEY", "").strip()
+    endpoint = os.environ.get("MUSIC_MOUNTAIN_LLM_ENDPOINT", "https://api.openai.com/v1/chat/completions").strip()
+    model = os.environ.get("MUSIC_MOUNTAIN_LLM_MODEL", "gpt-4o-mini").strip()
+    provider = os.environ.get("MUSIC_MOUNTAIN_LLM_PROVIDER", "openai-compatible").strip()
+    timeout = int(os.environ.get("MUSIC_MOUNTAIN_LLM_TIMEOUT", "90"))
+    temperature = float(os.environ.get("MUSIC_MOUNTAIN_LLM_TEMPERATURE", "0.2"))
+
+    if not api_key:
+        raise RuntimeError("MUSIC_MOUNTAIN_LLM_API_KEY is empty. Configure Music Mountain Director settings in UE.")
+    if not endpoint:
+        raise RuntimeError("MUSIC_MOUNTAIN_LLM_ENDPOINT is empty")
+    if not model:
+        raise RuntimeError("MUSIC_MOUNTAIN_LLM_MODEL is empty")
+
+    request_payload = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are the Music Mountain LLM Director. Return one valid JSON object only.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    }
+
+    data = json.dumps(request_payload).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": f"MusicMountainDirector/{provider}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"LLM HTTP {exc.code}: {error_body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"LLM request failed: {exc}") from exc
+
+    choices = response_payload.get("choices", [])
+    if not choices:
+        raise RuntimeError(f"LLM response contained no choices: {response_payload}")
+
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    if not content:
+        raise RuntimeError(f"LLM response did not contain message content: {response_payload}")
+
+    return extract_json_object(content)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate Music Mountain JSON from an audio file.")
     parser.add_argument("audio", type=Path, help="Input audio path. WAV works without extra tools; MP3/MP4 usually need librosa + ffmpeg.")
     parser.add_argument("--output", "-o", type=Path, default=DEFAULT_OUTPUT, help=f"Output JSON path. Default: {DEFAULT_OUTPUT}")
     parser.add_argument("--style-hint", default="", help="Optional semantic style hint, e.g. romantic, sweet, melancholy, 情歌, 伤感.")
+    parser.add_argument("--lookup-lyrics", action="store_true", help="Search LRCLIB by filename and import synced/plain lyrics into the output JSON.")
+    parser.add_argument("--llm-lyrics-query", action="store_true", help="Use the configured LLM to infer LRCLIB lyric search queries from the audio filename.")
     parser.add_argument("--lyrics-file", type=Path, help="Optional lyrics or user description file to include in the LLM Director prompt.")
     parser.add_argument("--director-prompt-output", type=Path, help="Write a prompt that can be pasted into an LLM Director.")
     parser.add_argument("--director-json", type=Path, help="Merge an LLM Director JSON plan into the generated analysis output.")
+    parser.add_argument("--call-llm-director", action="store_true", help="Call the configured OpenAI-compatible LLM Director and merge its JSON result.")
+    parser.add_argument("--director-json-output", type=Path, help="Optional path to save the raw LLM Director JSON response.")
     parser.add_argument("--pretty", action="store_true", help="Print the generated JSON to stdout.")
     args = parser.parse_args()
 
@@ -618,11 +904,20 @@ def main() -> int:
 
     try:
         features = analyze_audio(args.audio)
-        payload = build_music_json(args.audio, features, args.style_hint)
+        payload = build_music_json(args.audio, features, args.style_hint, args.lookup_lyrics, args.llm_lyrics_query)
         if args.director_prompt_output:
             lyrics = read_optional_text(args.lyrics_file)
             args.director_prompt_output.parent.mkdir(parents=True, exist_ok=True)
-            args.director_prompt_output.write_text(build_director_prompt(payload, lyrics), encoding="utf-8")
+            director_prompt = build_director_prompt(payload, lyrics)
+            args.director_prompt_output.write_text(director_prompt, encoding="utf-8")
+        if args.call_llm_director:
+            lyrics = read_optional_text(args.lyrics_file)
+            director_prompt = build_director_prompt(payload, lyrics)
+            director_plan = call_openai_compatible_director(director_prompt)
+            if args.director_json_output:
+                args.director_json_output.parent.mkdir(parents=True, exist_ok=True)
+                args.director_json_output.write_text(json.dumps(director_plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            payload = merge_director_plan(payload, director_plan)
         if args.director_json:
             director_plan = json.loads(args.director_json.read_text(encoding="utf-8"))
             payload = merge_director_plan(payload, director_plan)
@@ -638,10 +933,26 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
 
     print(f"Wrote Music Mountain analysis: {args.output}")
+    lyrics_source = payload.get("lyrics_source", {})
+    if lyrics_source:
+        print("[lyrics]")
+        print(f"status: {lyrics_source.get('status', 'unknown')}")
+        print(f"query: {lyrics_source.get('query', {})}")
+        if lyrics_source.get("source"):
+            print(f"source: {lyrics_source.get('source')} ({lyrics_source.get('source_type', 'unknown')})")
+        if lyrics_source.get("track") or lyrics_source.get("artist"):
+            print(f"matched: {lyrics_source.get('artist', '')} - {lyrics_source.get('track', '')}")
+        if lyrics_source.get("reason"):
+            print(f"reason: {lyrics_source.get('reason')}")
+        print(f"imported_lines: {len(payload.get('lyrics', []))}")
     if args.director_prompt_output:
         print(f"Wrote LLM Director prompt: {args.director_prompt_output}")
     if args.director_json:
         print(f"Merged LLM Director plan: {args.director_json}")
+    if args.call_llm_director:
+        print("Called configured LLM Director and merged response.")
+    if args.director_json_output:
+        print(f"Wrote raw LLM Director JSON: {args.director_json_output}")
     print(f"BPM: {payload['bpm']} | Seed: {payload['mountain_plan']['generation_seed']} | Theme: {payload['theme']}")
     return 0
 

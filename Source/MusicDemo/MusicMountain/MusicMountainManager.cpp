@@ -2,6 +2,8 @@
 
 #include "MusicMountainManager.h"
 
+#include "MusicMountainPCGSectionActor.h"
+#include "MusicMountainPCGPreviewSettings.h"
 #include "MusicMountainRuntimeHUD.h"
 #include "Components/AudioComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -11,11 +13,17 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
+#include "HttpModule.h"
 #include "InputCoreTypes.h"
+#include "Interfaces/IHttpRequest.h"
+#include "Interfaces/IHttpResponse.h"
 #include "Kismet/GameplayStatics.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "PCGCommon.h"
+#include "PCGGraph.h"
+#include "PCGInputOutputSettings.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -50,6 +58,7 @@ void AMusicMountainManager::BeginPlay()
 	{
 		SetMusicSound(DemoMusic);
 	}
+	LoadClientLLMSettings();
 
 	MusicComponent->OnAudioFinished.AddDynamic(this, &AMusicMountainManager::HandleMusicFinished);
 
@@ -70,6 +79,11 @@ void AMusicMountainManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 void AMusicMountainManager::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+
+	if (IsMusicPlaying())
+	{
+		MusicPlaybackSeconds += DeltaSeconds;
+	}
 
 	APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
 	if (!PlayerPawn || Sections.Num() == 0)
@@ -125,7 +139,11 @@ void AMusicMountainManager::GenerateDemoMountain()
 {
 	ClearGeneratedMountain();
 
-	if (!LoadAnalysis())
+	if (bUseLoadedAnalysisForNextGenerate)
+	{
+		bUseLoadedAnalysisForNextGenerate = false;
+	}
+	else if (!LoadAnalysis())
 	{
 		BuildFallbackAnalysis();
 	}
@@ -222,7 +240,10 @@ void AMusicMountainManager::ClearGeneratedMountain()
 	}
 
 	GeneratedActors.Reset();
-	Sections.Reset();
+	if (!bUseLoadedAnalysisForNextGenerate)
+	{
+		Sections.Reset();
+	}
 	RoutePoints.Reset();
 	CurrentSectionIndex = INDEX_NONE;
 	TotalRouteDistance = 1.0f;
@@ -257,6 +278,7 @@ void AMusicMountainManager::PlayMusic()
 
 	MusicComponent->SetPaused(false);
 	MusicComponent->Play(0.0f);
+	MusicPlaybackSeconds = 0.0f;
 	bMusicPaused = false;
 }
 
@@ -296,6 +318,7 @@ void AMusicMountainManager::StopMusic()
 		MusicComponent->Stop();
 	}
 	bMusicPaused = false;
+	MusicPlaybackSeconds = 0.0f;
 }
 
 void AMusicMountainManager::ToggleMusicPaused()
@@ -394,6 +417,251 @@ float AMusicMountainManager::GetMusicBpm() const
 bool AMusicMountainManager::IsDemoCompleted() const
 {
 	return bDemoCompleted;
+}
+
+FString AMusicMountainManager::GetCurrentSubtitleSpeaker() const
+{
+	if (const FMusicMountainLyricLine* LyricLine = FindCurrentLyricLine())
+	{
+		return LyricLine->Speaker;
+	}
+	return TEXT("");
+}
+
+FString AMusicMountainManager::GetCurrentSubtitleText() const
+{
+	const FMusicMountainLyricLine* LyricLine = FindCurrentLyricLine();
+	if (!LyricLine)
+	{
+		return TEXT("");
+	}
+
+	const float Duration = FMath::Max(LyricLine->EndTime - LyricLine->StartTime, 0.1f);
+	const float RevealAlpha = FMath::Clamp((GetMusicPlaybackSeconds() - LyricLine->StartTime) / Duration, 0.0f, 1.0f);
+	const int32 CharacterCount = FMath::Clamp(FMath::CeilToInt(LyricLine->Text.Len() * RevealAlpha), 1, LyricLine->Text.Len());
+	return LyricLine->Text.Left(CharacterCount);
+}
+
+FString AMusicMountainManager::GetCurrentSubtitleMood() const
+{
+	if (const FMusicMountainLyricLine* LyricLine = FindCurrentLyricLine())
+	{
+		return LyricLine->Mood;
+	}
+	return TEXT("");
+}
+
+bool AMusicMountainManager::HasActiveSubtitle() const
+{
+	return FindCurrentLyricLine() != nullptr;
+}
+
+FString AMusicMountainManager::GetClientLLMProvider() const
+{
+	return ClientLLMProvider;
+}
+
+FString AMusicMountainManager::GetClientLLMEndpoint() const
+{
+	return ClientLLMEndpoint;
+}
+
+FString AMusicMountainManager::GetClientLLMModel() const
+{
+	return ClientLLMModel;
+}
+
+FString AMusicMountainManager::GetClientLLMApiKey() const
+{
+	return ClientLLMApiKey;
+}
+
+void AMusicMountainManager::SetClientLLMProvider(const FString& Provider)
+{
+	ClientLLMProvider = Provider.TrimStartAndEnd().ToLower();
+	if (ClientLLMProvider == TEXT("deepseek"))
+	{
+		ClientLLMEndpoint = TEXT("https://api.deepseek.com/chat/completions");
+		ClientLLMModel = TEXT("deepseek-chat");
+	}
+	else if (ClientLLMProvider == TEXT("gpt"))
+	{
+		ClientLLMEndpoint = TEXT("https://api.openai.com/v1/chat/completions");
+		ClientLLMModel = TEXT("gpt-4o-mini");
+	}
+	else if (ClientLLMProvider == TEXT("gemini"))
+	{
+		ClientLLMEndpoint = TEXT("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+		ClientLLMModel = TEXT("gemini-2.0-flash");
+	}
+	else if (ClientLLMProvider == TEXT("claude"))
+	{
+		ClientLLMEndpoint = TEXT("https://api.anthropic.com/v1/messages");
+		ClientLLMModel = TEXT("claude-3-5-haiku-latest");
+	}
+}
+
+void AMusicMountainManager::SetClientLLMSettings(const FString& Provider, const FString& Endpoint, const FString& Model, const FString& ApiKey)
+{
+	ClientLLMProvider = Provider.TrimStartAndEnd().ToLower();
+	ClientLLMEndpoint = Endpoint.TrimStartAndEnd();
+	ClientLLMModel = Model.TrimStartAndEnd();
+	ClientLLMApiKey = ApiKey.TrimStartAndEnd();
+}
+
+bool AMusicMountainManager::SaveClientLLMSettings() const
+{
+	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
+	RootObject->SetStringField(TEXT("provider"), ClientLLMProvider);
+	RootObject->SetStringField(TEXT("endpoint"), ClientLLMEndpoint);
+	RootObject->SetStringField(TEXT("model"), ClientLLMModel);
+	RootObject->SetStringField(TEXT("api_key"), ClientLLMApiKey);
+	RootObject->SetStringField(TEXT("warning"), TEXT("BYOK demo setting. The API key is stored locally in plain text."));
+
+	FString OutputText;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputText);
+	if (!FJsonSerializer::Serialize(RootObject, Writer))
+	{
+		return false;
+	}
+
+	const FString SettingsPath = GetClientLLMSettingsPath();
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(SettingsPath), true);
+	return FFileHelper::SaveStringToFile(OutputText + LINE_TERMINATOR, *SettingsPath);
+}
+
+void AMusicMountainManager::RequestClientLLMDirector()
+{
+	if (bClientLLMRequestInFlight)
+	{
+		ClientLLMStatusText = TEXT("Client LLM request is already running.");
+		return;
+	}
+	if (ClientLLMEndpoint.IsEmpty() || ClientLLMModel.IsEmpty() || ClientLLMApiKey.IsEmpty())
+	{
+		ClientLLMStatusText = TEXT("Client LLM settings are incomplete. Fill Endpoint, Model, and API Key first.");
+		return;
+	}
+	if (Sections.Num() == 0)
+	{
+		ClientLLMStatusText = TEXT("No music analysis is loaded yet.");
+		return;
+	}
+
+	const FString Prompt = BuildClientLLMDirectorPrompt();
+	TSharedRef<FJsonObject> RequestRoot = MakeShared<FJsonObject>();
+	RequestRoot->SetStringField(TEXT("model"), ClientLLMModel);
+	RequestRoot->SetNumberField(TEXT("temperature"), 0.2);
+
+	if (ClientLLMProvider == TEXT("claude"))
+	{
+		RequestRoot->SetNumberField(TEXT("max_tokens"), 2048);
+		RequestRoot->SetStringField(TEXT("system"), TEXT("You are the Music Mountain LLM Director. Return one valid JSON object only."));
+
+		TArray<TSharedPtr<FJsonValue>> Messages;
+		TSharedRef<FJsonObject> UserMessage = MakeShared<FJsonObject>();
+		UserMessage->SetStringField(TEXT("role"), TEXT("user"));
+		UserMessage->SetStringField(TEXT("content"), Prompt);
+		Messages.Add(MakeShared<FJsonValueObject>(UserMessage));
+		RequestRoot->SetArrayField(TEXT("messages"), Messages);
+	}
+	else
+	{
+		TArray<TSharedPtr<FJsonValue>> Messages;
+		TSharedRef<FJsonObject> SystemMessage = MakeShared<FJsonObject>();
+		SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
+		SystemMessage->SetStringField(TEXT("content"), TEXT("You are the Music Mountain LLM Director. Return one valid JSON object only."));
+		Messages.Add(MakeShared<FJsonValueObject>(SystemMessage));
+
+		TSharedRef<FJsonObject> UserMessage = MakeShared<FJsonObject>();
+		UserMessage->SetStringField(TEXT("role"), TEXT("user"));
+		UserMessage->SetStringField(TEXT("content"), Prompt);
+		Messages.Add(MakeShared<FJsonValueObject>(UserMessage));
+		RequestRoot->SetArrayField(TEXT("messages"), Messages);
+	}
+
+	FString RequestBody;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&RequestBody);
+	if (!FJsonSerializer::Serialize(RequestRoot, Writer))
+	{
+		ClientLLMStatusText = TEXT("Failed to serialize client LLM request.");
+		return;
+	}
+
+	bClientLLMRequestInFlight = true;
+	ClientLLMStatusText = TEXT("Client LLM request running...");
+
+	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(ClientLLMEndpoint);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	if (ClientLLMProvider == TEXT("claude"))
+	{
+		Request->SetHeader(TEXT("x-api-key"), ClientLLMApiKey);
+		Request->SetHeader(TEXT("anthropic-version"), TEXT("2023-06-01"));
+	}
+	else
+	{
+		Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *ClientLLMApiKey));
+	}
+	Request->SetContentAsString(RequestBody);
+	Request->OnProcessRequestComplete().BindLambda(
+		[this](FHttpRequestPtr RequestPtr, FHttpResponsePtr Response, bool bWasSuccessful)
+		{
+			bClientLLMRequestInFlight = false;
+			if (!bWasSuccessful || !Response.IsValid())
+			{
+				ClientLLMStatusText = TEXT("Client LLM request failed: no response.");
+				return;
+			}
+
+			const int32 ResponseCode = Response->GetResponseCode();
+			const FString ResponseText = Response->GetContentAsString();
+			if (ResponseCode < 200 || ResponseCode >= 300)
+			{
+				ClientLLMStatusText = FString::Printf(TEXT("Client LLM HTTP %d: %s"), ResponseCode, *ResponseText.Left(512));
+				return;
+			}
+
+			if (!ApplyClientLLMDirectorJson(ResponseText))
+			{
+				ClientLLMStatusText = TEXT("Client LLM returned JSON, but Director plan could not be applied.");
+				return;
+			}
+
+			ClientLLMStatusText = TEXT("Client LLM Director applied. Mountain regenerated.");
+			bUseLoadedAnalysisForNextGenerate = true;
+			GenerateDemoMountain();
+		});
+	Request->ProcessRequest();
+}
+
+FString AMusicMountainManager::GetClientLLMStatusText() const
+{
+	return ClientLLMStatusText;
+}
+
+FString AMusicMountainManager::GetLyricsLookupStatusText() const
+{
+	FString Status = FString::Printf(TEXT("Lyrics: %s | lines: %d"), *LyricsSourceStatus, Lyrics.Num());
+	if (!LyricsSourceName.IsEmpty())
+	{
+		Status += FString::Printf(TEXT(" | source: %s"), *LyricsSourceName);
+	}
+	if (!LyricsSourceType.IsEmpty())
+	{
+		Status += FString::Printf(TEXT(" | type: %s"), *LyricsSourceType);
+	}
+	if (!LyricsSourceQuery.IsEmpty())
+	{
+		Status += FString::Printf(TEXT(" | query: %s"), *LyricsSourceQuery);
+	}
+	return Status;
+}
+
+bool AMusicMountainManager::IsClientLLMRequestInFlight() const
+{
+	return bClientLLMRequestInFlight;
 }
 
 bool AMusicMountainManager::LoadAnalysis()
@@ -517,6 +785,55 @@ bool AMusicMountainManager::LoadAnalysis()
 		return false;
 	}
 
+	LyricsSourceStatus = TEXT("missing");
+	LyricsSourceName = TEXT("");
+	LyricsSourceType = TEXT("");
+	LyricsSourceQuery = TEXT("");
+	const TSharedPtr<FJsonObject>* LyricsSourceObject = nullptr;
+	if (RootObject->TryGetObjectField(TEXT("lyrics_source"), LyricsSourceObject) && LyricsSourceObject && LyricsSourceObject->IsValid())
+	{
+		const TSharedPtr<FJsonObject>& SourceObject = *LyricsSourceObject;
+		LyricsSourceStatus = SourceObject->HasTypedField<EJson::String>(TEXT("status")) ? SourceObject->GetStringField(TEXT("status")) : LyricsSourceStatus;
+		LyricsSourceName = SourceObject->HasTypedField<EJson::String>(TEXT("source")) ? SourceObject->GetStringField(TEXT("source")) : TEXT("");
+		LyricsSourceType = SourceObject->HasTypedField<EJson::String>(TEXT("source_type")) ? SourceObject->GetStringField(TEXT("source_type")) : TEXT("");
+
+		const TSharedPtr<FJsonObject>* QueryObject = nullptr;
+		if (SourceObject->TryGetObjectField(TEXT("query"), QueryObject) && QueryObject && QueryObject->IsValid())
+		{
+			FString QueryJson;
+			const TSharedRef<TJsonWriter<>> QueryWriter = TJsonWriterFactory<>::Create(&QueryJson);
+			FJsonSerializer::Serialize(QueryObject->ToSharedRef(), QueryWriter);
+			LyricsSourceQuery = QueryJson;
+		}
+	}
+
+	Lyrics.Reset();
+	const TArray<TSharedPtr<FJsonValue>>* LyricValues = nullptr;
+	if (RootObject->TryGetArrayField(TEXT("lyrics"), LyricValues) && LyricValues)
+	{
+		for (const TSharedPtr<FJsonValue>& LyricValue : *LyricValues)
+		{
+			const TSharedPtr<FJsonObject> LyricObject = LyricValue->AsObject();
+			if (!LyricObject.IsValid())
+			{
+				continue;
+			}
+
+			FMusicMountainLyricLine LyricLine;
+			LyricLine.StartTime = LyricObject->HasTypedField<EJson::Number>(TEXT("start")) ? static_cast<float>(LyricObject->GetNumberField(TEXT("start"))) : 0.0f;
+			LyricLine.EndTime = LyricObject->HasTypedField<EJson::Number>(TEXT("end")) ? static_cast<float>(LyricObject->GetNumberField(TEXT("end"))) : LyricLine.StartTime + 3.0f;
+			LyricLine.Speaker = LyricObject->HasTypedField<EJson::String>(TEXT("speaker")) ? LyricObject->GetStringField(TEXT("speaker")) : TEXT("Song");
+			LyricLine.Text = LyricObject->HasTypedField<EJson::String>(TEXT("text")) ? LyricObject->GetStringField(TEXT("text")) : TEXT("");
+			LyricLine.Mood = LyricObject->HasTypedField<EJson::String>(TEXT("mood")) ? LyricObject->GetStringField(TEXT("mood")) : TEXT("");
+			if (!LyricLine.Text.IsEmpty())
+			{
+				Lyrics.Add(LyricLine);
+			}
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("Music Mountain %s"), *GetLyricsLookupStatusText());
+
 	Sections.Reset();
 	for (const TSharedPtr<FJsonValue>& SectionValue : *SectionValues)
 	{
@@ -566,6 +883,7 @@ void AMusicMountainManager::BuildFallbackAnalysis()
 	};
 
 	Sections.Reset();
+	Lyrics.Reset();
 	for (int32 Index = 0; Index < UE_ARRAY_COUNT(Defaults); ++Index)
 	{
 		FMusicMountainSection Section;
@@ -579,6 +897,10 @@ void AMusicMountainManager::BuildFallbackAnalysis()
 		Section.ThemeColor = ResolveThemeColor(Section);
 		Sections.Add(Section);
 	}
+
+	Lyrics.Add({ 0.0f, 4.0f, TEXT("测试字幕"), TEXT("测试歌词 1：字幕系统正在显示。"), TEXT("calm") });
+	Lyrics.Add({ 30.0f, 34.0f, TEXT("测试字幕"), TEXT("测试歌词 2：客户端 LLM 流程后仍应显示。"), TEXT("dark") });
+	Lyrics.Add({ 60.0f, 64.0f, TEXT("测试字幕"), TEXT("测试歌词 3：米塔风格字幕效果检查。"), TEXT("epic") });
 }
 
 void AMusicMountainManager::GenerateSpiralRoutePoints(const FVector& StartLocation, float GroundZ)
@@ -773,6 +1095,232 @@ void AMusicMountainManager::GenerateSection(int32 SectionIndex, FMusicMountainSe
 				RockColor);
 		}
 	}
+
+	SpawnPCGSectionVolume(SectionIndex, Section, PointIndices, SectionRoadWidth, SectionOuterSlopeWidth);
+}
+
+void AMusicMountainManager::SpawnPCGSectionVolume(int32 SectionIndex, const FMusicMountainSection& Section, const TArray<int32>& PointIndices, float SectionRoadWidth, float SectionOuterSlopeWidth)
+{
+	UPCGGraphInterface* GraphToUse = GetOrCreatePCGGraph();
+	if (!bEnablePCGSectionVolumes || !GraphToUse || !GetWorld() || PointIndices.Num() == 0)
+	{
+		return;
+	}
+
+	FBox SectionBounds(ForceInit);
+	const float HorizontalPadding = FMath::Max(PCGSectionBoundsPadding, 0.0f) + SectionRoadWidth + SectionOuterSlopeWidth;
+	const float VerticalExtent = FMath::Max(PCGSectionBoundsHeight * 0.5f, 50.0f);
+	for (const int32 PointIndex : PointIndices)
+	{
+		if (!RoutePoints.IsValidIndex(PointIndex))
+		{
+			continue;
+		}
+
+		const FMusicMountainRoutePoint& RoutePoint = RoutePoints[PointIndex];
+		SectionBounds += RoutePoint.Location + RoutePoint.Inward * HorizontalPadding + FVector(0.0f, 0.0f, VerticalExtent);
+		SectionBounds += RoutePoint.Location + RoutePoint.Outward * HorizontalPadding - FVector(0.0f, 0.0f, VerticalExtent);
+	}
+
+	if (!SectionBounds.IsValid)
+	{
+		return;
+	}
+
+	TArray<FVector> RouteLocations;
+	TArray<FVector> InnerScatterLocations;
+	TArray<FVector> OuterScatterLocations;
+	RouteLocations.Reserve(PointIndices.Num());
+	InnerScatterLocations.Reserve(PointIndices.Num());
+	OuterScatterLocations.Reserve(PointIndices.Num());
+
+	const float RoadExclusionHalfWidth = SectionRoadWidth * 0.62f;
+	const float ScatterWidth = FMath::Max(SectionOuterSlopeWidth, 150.0f);
+	const float InnerScatterOffset = RoadExclusionHalfWidth + ScatterWidth * 0.35f;
+	const float OuterScatterOffset = RoadExclusionHalfWidth + ScatterWidth * 0.65f;
+	for (const int32 PointIndex : PointIndices)
+	{
+		if (RoutePoints.IsValidIndex(PointIndex))
+		{
+			const FMusicMountainRoutePoint& RoutePoint = RoutePoints[PointIndex];
+			RouteLocations.Add(RoutePoint.Location);
+			InnerScatterLocations.Add(RoutePoint.Location + RoutePoint.Inward * InnerScatterOffset);
+			OuterScatterLocations.Add(RoutePoint.Location + RoutePoint.Outward * OuterScatterOffset);
+		}
+	}
+
+	AMusicMountainPCGSectionActor* PCGActor = GetWorld()->SpawnActor<AMusicMountainPCGSectionActor>(AMusicMountainPCGSectionActor::StaticClass(), SectionBounds.GetCenter(), FRotator::ZeroRotator);
+	if (!PCGActor)
+	{
+		return;
+	}
+
+	PCGActor->ConfigureSection(
+		SectionIndex,
+		Section.Name,
+		Section.Mood,
+		Section.Terrain,
+		Section.AudioStyle,
+		Section.Energy,
+		Section.RouteStartDistance,
+		Section.RouteEndDistance,
+		Section.RouteRadius,
+		Section.ThemeColor,
+		SectionBounds,
+		RouteLocations,
+		InnerScatterLocations,
+		OuterScatterLocations,
+		RoadExclusionHalfWidth,
+		ScatterWidth,
+		GraphToUse,
+		GenerationSeed + SectionIndex * 1009);
+
+	GeneratedActors.Add(PCGActor);
+}
+
+UPCGGraphInterface* AMusicMountainManager::GetOrCreatePCGGraph()
+{
+	if (SectionPCGGraph)
+	{
+		return SectionPCGGraph;
+	}
+
+	if (!bGeneratePCGPreviewDecorations)
+	{
+		return nullptr;
+	}
+
+	if (RuntimePreviewPCGGraph)
+	{
+		return RuntimePreviewPCGGraph;
+	}
+
+	RuntimePreviewPCGGraph = NewObject<UPCGGraph>(this, TEXT("MusicMountainRuntimePreviewPCGGraph"), RF_Transient);
+	if (!RuntimePreviewPCGGraph)
+	{
+		return nullptr;
+	}
+
+	UPCGSettings* PreviewSettings = nullptr;
+	UPCGNode* PreviewNode = RuntimePreviewPCGGraph->AddNodeOfType(UPCGMusicMountainPreviewSettings::StaticClass(), PreviewSettings);
+	if (UPCGMusicMountainPreviewSettings* MusicPreviewSettings = Cast<UPCGMusicMountainPreviewSettings>(PreviewSettings))
+	{
+		MusicPreviewSettings->DensityMultiplier = PCGPreviewDensityMultiplier;
+	}
+
+	if (PreviewNode)
+	{
+		RuntimePreviewPCGGraph->AddEdge(RuntimePreviewPCGGraph->GetInputNode(), PCGInputOutputConstants::DefaultInputLabel, PreviewNode, PCGPinConstants::DefaultInputLabel);
+		RuntimePreviewPCGGraph->AddEdge(PreviewNode, PCGPinConstants::DefaultOutputLabel, RuntimePreviewPCGGraph->GetOutputNode(), PCGInputOutputConstants::DefaultInputLabel);
+#if WITH_EDITOR
+		RuntimePreviewPCGGraph->ForceNotificationForEditor(EPCGChangeType::Structural);
+#endif
+	}
+
+	return RuntimePreviewPCGGraph;
+}
+
+void AMusicMountainManager::SpawnPCGPreviewDecorations(int32 SectionIndex, const FMusicMountainSection& Section, const TArray<int32>& PointIndices, float SectionRoadWidth, float SectionOuterSlopeWidth)
+{
+	if (!bGeneratePCGPreviewDecorations || SectionPCGGraph || !GetWorld() || PointIndices.Num() == 0 || !SphereMesh || !CubeMesh)
+	{
+		return;
+	}
+
+	const FString MoodLower = Section.Mood.ToLower();
+	const FString TerrainLower = Section.Terrain.ToLower();
+	const float FoliageDensity = FMath::Clamp(FMath::Lerp(0.25f, 0.9f, 1.0f - Section.Energy) + ((MoodLower.Contains(TEXT("romantic")) || MoodLower.Contains(TEXT("sweet")) || TerrainLower.Contains(TEXT("flower")) || TerrainLower.Contains(TEXT("meadow"))) ? 0.45f : 0.0f), 0.0f, 1.25f);
+	const float RockDensity = FMath::Clamp(FMath::Lerp(0.35f, 1.0f, Section.Energy) + ((MoodLower.Contains(TEXT("dark")) || MoodLower.Contains(TEXT("tense")) || TerrainLower.Contains(TEXT("cliff")) || TerrainLower.Contains(TEXT("cave"))) ? 0.35f : 0.0f), 0.0f, 1.25f);
+	const float LightDensity = FMath::Clamp(FMath::Lerp(0.18f, 0.65f, Section.Energy) + ((MoodLower.Contains(TEXT("epic")) || TerrainLower.Contains(TEXT("summit")) || TerrainLower.Contains(TEXT("ridge"))) ? 0.25f : 0.0f), 0.0f, 1.0f);
+	const float DensityScale = FMath::Clamp(PCGPreviewDensityMultiplier, 0.2f, 3.0f);
+	const int32 Stride = FMath::Max(2, FMath::RoundToInt(FMath::Lerp(7.0f, 3.0f, Section.Energy) / DensityScale));
+	const float RoadExclusionHalfWidth = SectionRoadWidth * 0.62f;
+	const float ScatterWidth = FMath::Max(SectionOuterSlopeWidth, 150.0f);
+	const FLinearColor FoliageColor = (MoodLower.Contains(TEXT("romantic")) || MoodLower.Contains(TEXT("sweet")))
+		? FLinearColor(0.95f, 0.35f, 0.62f)
+		: FLinearColor(0.18f, 0.46f, 0.22f);
+	const FLinearColor RockColor = ResolveRockColor(Section);
+	const FLinearColor LightColor = FLinearColor::LerpUsingHSV(Section.ThemeColor, FLinearColor(1.0f, 0.86f, 0.38f), 0.45f);
+	FRandomStream PreviewRandom(GenerationSeed + SectionIndex * 1709 + 401);
+
+	for (int32 LocalIndex = 0; LocalIndex < PointIndices.Num(); LocalIndex += Stride)
+	{
+		const int32 PointIndex = PointIndices[LocalIndex];
+		if (!RoutePoints.IsValidIndex(PointIndex))
+		{
+			continue;
+		}
+
+		const FMusicMountainRoutePoint& RoutePoint = RoutePoints[PointIndex];
+		const bool bUseOuterSide = PreviewRandom.FRand() > 0.35f;
+		const FVector SideDirection = bUseOuterSide ? RoutePoint.Outward : RoutePoint.Inward;
+		const float SideOffset = RoadExclusionHalfWidth + PreviewRandom.FRandRange(ScatterWidth * 0.25f, ScatterWidth * 0.95f);
+		const FVector BaseLocation = RoutePoint.Location
+			+ SideDirection * SideOffset
+			+ RoutePoint.Tangent * PreviewRandom.FRandRange(-90.0f, 90.0f);
+
+		if (PreviewRandom.FRand() < FoliageDensity)
+		{
+			const bool bFlowerPatch = MoodLower.Contains(TEXT("romantic")) || MoodLower.Contains(TEXT("sweet")) || TerrainLower.Contains(TEXT("flower")) || TerrainLower.Contains(TEXT("meadow"));
+			if (bFlowerPatch)
+			{
+				const int32 FlowerCount = PreviewRandom.RandRange(3, 6);
+				for (int32 FlowerIndex = 0; FlowerIndex < FlowerCount; ++FlowerIndex)
+				{
+					const FVector FlowerLocation = BaseLocation + FVector(PreviewRandom.FRandRange(-90.0f, 90.0f), PreviewRandom.FRandRange(-90.0f, 90.0f), 34.0f);
+					SpawnPreviewDecoration(
+						FString::Printf(TEXT("%s PCG Preview Flower %d-%d"), *Section.Name, LocalIndex, FlowerIndex),
+						SphereMesh,
+						FlowerLocation,
+						FVector(0.13f, 0.13f, 0.08f),
+						FoliageColor);
+				}
+			}
+			else
+			{
+				SpawnPreviewDecoration(
+					FString::Printf(TEXT("%s PCG Preview Tree Trunk %d"), *Section.Name, LocalIndex),
+					CubeMesh,
+					BaseLocation + FVector(0.0f, 0.0f, 80.0f),
+					FVector(0.16f, 0.16f, 1.25f),
+					FLinearColor(0.23f, 0.13f, 0.07f),
+					FRotator(0.0f, PreviewRandom.FRandRange(-35.0f, 35.0f), 0.0f));
+				SpawnPreviewDecoration(
+					FString::Printf(TEXT("%s PCG Preview Tree Crown %d"), *Section.Name, LocalIndex),
+					SphereMesh,
+					BaseLocation + FVector(0.0f, 0.0f, 190.0f),
+					FVector(0.75f, 0.75f, 0.62f) * PreviewRandom.FRandRange(0.75f, 1.25f),
+					FoliageColor);
+			}
+		}
+
+		if (PreviewRandom.FRand() < RockDensity)
+		{
+			SpawnPreviewDecoration(
+				FString::Printf(TEXT("%s PCG Preview Rock %d"), *Section.Name, LocalIndex),
+				SphereMesh,
+				BaseLocation + SideDirection * PreviewRandom.FRandRange(90.0f, 220.0f) + FVector(0.0f, 0.0f, 60.0f),
+				FVector(0.45f, 0.62f, 0.38f) * PreviewRandom.FRandRange(0.75f, 1.45f),
+				RockColor);
+		}
+
+		if (PreviewRandom.FRand() < LightDensity)
+		{
+			const FVector LightBaseLocation = RoutePoint.Location + SideDirection * (RoadExclusionHalfWidth + 85.0f) + FVector(0.0f, 0.0f, 80.0f);
+			SpawnPreviewDecoration(
+				FString::Printf(TEXT("%s PCG Preview Light Pole %d"), *Section.Name, LocalIndex),
+				CubeMesh,
+				LightBaseLocation,
+				FVector(0.1f, 0.1f, 1.2f),
+				FLinearColor(0.08f, 0.07f, 0.1f));
+			SpawnPreviewDecoration(
+				FString::Printf(TEXT("%s PCG Preview Light Orb %d"), *Section.Name, LocalIndex),
+				SphereMesh,
+				LightBaseLocation + FVector(0.0f, 0.0f, 95.0f),
+				FVector(0.22f, 0.22f, 0.22f),
+				LightColor);
+		}
+	}
 }
 
 void AMusicMountainManager::SpawnPlatform(const FString& Label, const FVector& SurfaceCenter, const FVector& Size, const FLinearColor& Color, const FRotator& Rotation)
@@ -792,9 +1340,9 @@ void AMusicMountainManager::SpawnPlatform(const FString& Label, const FVector& S
 	Actor->SetActorLabel(Label);
 #endif
 	UStaticMeshComponent* MeshComponent = Actor->GetStaticMeshComponent();
+	MeshComponent->SetMobility(EComponentMobility::Movable);
 	MeshComponent->SetStaticMesh(CubeMesh);
 	MeshComponent->SetWorldScale3D(Size / 100.0f);
-	MeshComponent->SetMobility(EComponentMobility::Movable);
 	MeshComponent->SetCollisionProfileName(TEXT("BlockAll"));
 	MeshComponent->SetCullDistance(GetClampedVisibilityRangeCm());
 
@@ -832,9 +1380,9 @@ void AMusicMountainManager::SpawnSlopedBlock(const FString& Label, const FVector
 	Actor->SetActorLabel(Label);
 #endif
 	UStaticMeshComponent* MeshComponent = Actor->GetStaticMeshComponent();
+	MeshComponent->SetMobility(EComponentMobility::Movable);
 	MeshComponent->SetStaticMesh(CubeMesh);
 	MeshComponent->SetWorldScale3D(FVector(Hypotenuse / 100.0f, Width / 100.0f, Thickness / 100.0f));
-	MeshComponent->SetMobility(EComponentMobility::Movable);
 	MeshComponent->SetCollisionEnabled(bEnableCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
 	MeshComponent->SetCollisionProfileName(bEnableCollision ? TEXT("BlockAll") : TEXT("NoCollision"));
 	MeshComponent->SetCullDistance(GetClampedVisibilityRangeCm());
@@ -872,10 +1420,44 @@ void AMusicMountainManager::SpawnDecoration(const FString& Label, const FVector&
 	Actor->SetActorLabel(Label);
 #endif
 	UStaticMeshComponent* MeshComponent = Actor->GetStaticMeshComponent();
+	MeshComponent->SetMobility(EComponentMobility::Movable);
 	MeshComponent->SetStaticMesh(MeshToUse);
 	MeshComponent->SetWorldScale3D(Scale);
-	MeshComponent->SetMobility(EComponentMobility::Movable);
 	MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	MeshComponent->SetCullDistance(GetClampedVisibilityRangeCm());
+
+	if (BaseShapeMaterial)
+	{
+		UMaterialInstanceDynamic* Material = UMaterialInstanceDynamic::Create(BaseShapeMaterial, this);
+		Material->SetVectorParameterValue(TEXT("Color"), Color * 1.25f);
+		MeshComponent->SetMaterial(0, Material);
+	}
+
+	GeneratedActors.Add(Actor);
+}
+
+void AMusicMountainManager::SpawnPreviewDecoration(const FString& Label, UStaticMesh* Mesh, const FVector& Location, const FVector& Scale, const FLinearColor& Color, const FRotator& Rotation)
+{
+	if (!GetWorld() || !Mesh)
+	{
+		return;
+	}
+
+	AStaticMeshActor* Actor = GetWorld()->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), Location, Rotation);
+	if (!Actor)
+	{
+		return;
+	}
+
+#if WITH_EDITOR
+	Actor->SetActorLabel(Label);
+#endif
+	UStaticMeshComponent* MeshComponent = Actor->GetStaticMeshComponent();
+	MeshComponent->SetMobility(EComponentMobility::Movable);
+	MeshComponent->SetStaticMesh(Mesh);
+	MeshComponent->SetWorldScale3D(Scale);
+	MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	MeshComponent->SetCollisionProfileName(TEXT("NoCollision"));
 	MeshComponent->SetCullDistance(GetClampedVisibilityRangeCm());
 
 	if (BaseShapeMaterial)
@@ -1057,6 +1639,282 @@ void AMusicMountainManager::RemoveRuntimeHud()
 	RuntimeHudWidget.Reset();
 }
 
+void AMusicMountainManager::LoadClientLLMSettings()
+{
+	const FString SettingsPath = GetClientLLMSettingsPath();
+	FString JsonText;
+	if (!FFileHelper::LoadFileToString(JsonText, *SettingsPath))
+	{
+		return;
+	}
+
+	TSharedPtr<FJsonObject> RootObject;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+	if (!FJsonSerializer::Deserialize(Reader, RootObject) || !RootObject.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Music Mountain could not parse client LLM settings: %s"), *SettingsPath);
+		return;
+	}
+
+	ClientLLMEndpoint = RootObject->HasTypedField<EJson::String>(TEXT("endpoint"))
+		? RootObject->GetStringField(TEXT("endpoint"))
+		: ClientLLMEndpoint;
+	ClientLLMProvider = RootObject->HasTypedField<EJson::String>(TEXT("provider"))
+		? RootObject->GetStringField(TEXT("provider")).ToLower()
+		: ClientLLMProvider;
+	ClientLLMModel = RootObject->HasTypedField<EJson::String>(TEXT("model"))
+		? RootObject->GetStringField(TEXT("model"))
+		: ClientLLMModel;
+	ClientLLMApiKey = RootObject->HasTypedField<EJson::String>(TEXT("api_key"))
+		? RootObject->GetStringField(TEXT("api_key"))
+		: ClientLLMApiKey;
+}
+
+FString AMusicMountainManager::GetClientLLMSettingsPath() const
+{
+	return FPaths::ProjectSavedDir() / TEXT("MusicMountainClientLLMSettings.json");
+}
+
+FString AMusicMountainManager::BuildClientLLMDirectorPrompt() const
+{
+	TSharedRef<FJsonObject> Summary = MakeShared<FJsonObject>();
+	Summary->SetStringField(TEXT("track"), TrackName);
+	Summary->SetStringField(TEXT("display_name"), DisplayName);
+	Summary->SetNumberField(TEXT("bpm"), Bpm);
+	Summary->SetStringField(TEXT("theme"), Theme);
+	Summary->SetStringField(TEXT("lyrics_source_status"), LyricsSourceStatus);
+	Summary->SetStringField(TEXT("lyrics_source"), LyricsSourceName);
+	Summary->SetStringField(TEXT("lyrics_source_type"), LyricsSourceType);
+	Summary->SetNumberField(TEXT("lyrics_line_count"), Lyrics.Num());
+
+	TSharedRef<FJsonObject> MountainPlan = MakeShared<FJsonObject>();
+	MountainPlan->SetNumberField(TEXT("generation_seed"), GenerationSeed);
+	MountainPlan->SetNumberField(TEXT("mountain_height"), MountainHeight);
+	MountainPlan->SetNumberField(TEXT("base_path_radius"), BasePathRadius);
+	MountainPlan->SetNumberField(TEXT("top_path_radius"), TopPathRadius);
+	MountainPlan->SetNumberField(TEXT("total_turns"), TotalTurns);
+	MountainPlan->SetNumberField(TEXT("segments_per_turn"), SegmentsPerTurn);
+	MountainPlan->SetNumberField(TEXT("road_width"), RoadWidth);
+	MountainPlan->SetNumberField(TEXT("outer_slope_width"), OuterSlopeWidth);
+	MountainPlan->SetNumberField(TEXT("inner_wall_height"), InnerWallHeight);
+	MountainPlan->SetNumberField(TEXT("elevation_gain_multiplier"), ElevationGainMultiplier);
+	MountainPlan->SetNumberField(TEXT("max_ramp_pitch_degrees"), MaxRampPitchDegrees);
+	MountainPlan->SetNumberField(TEXT("visibility_range_meters"), VisibilityRangeMeters);
+
+	TSharedRef<FJsonObject> Variation = MakeShared<FJsonObject>();
+	Variation->SetNumberField(TEXT("radius"), RadiusVariationStrength);
+	Variation->SetNumberField(TEXT("height"), HeightVariationStrength);
+	Variation->SetNumberField(TEXT("road_width"), RoadWidthVariationStrength);
+	Variation->SetNumberField(TEXT("core"), CoreVariationStrength);
+	MountainPlan->SetObjectField(TEXT("variation"), Variation);
+	Summary->SetObjectField(TEXT("mountain_plan"), MountainPlan);
+
+	TArray<TSharedPtr<FJsonValue>> SectionValues;
+	for (const FMusicMountainSection& Section : Sections)
+	{
+		TSharedRef<FJsonObject> SectionObject = MakeShared<FJsonObject>();
+		SectionObject->SetStringField(TEXT("name"), Section.Name);
+		SectionObject->SetNumberField(TEXT("start"), Section.StartTime);
+		SectionObject->SetNumberField(TEXT("end"), Section.EndTime);
+		SectionObject->SetStringField(TEXT("mood"), Section.Mood);
+		SectionObject->SetNumberField(TEXT("energy"), Section.Energy);
+		SectionObject->SetStringField(TEXT("terrain"), Section.Terrain);
+		SectionObject->SetStringField(TEXT("audio_style"), Section.AudioStyle);
+		SectionValues.Add(MakeShared<FJsonValueObject>(SectionObject));
+	}
+	Summary->SetArrayField(TEXT("sections"), SectionValues);
+
+	TArray<TSharedPtr<FJsonValue>> LyricValues;
+	const int32 MaxLyricSamples = FMath::Min(Lyrics.Num(), 12);
+	for (int32 Index = 0; Index < MaxLyricSamples; ++Index)
+	{
+		const FMusicMountainLyricLine& LyricLine = Lyrics[Index];
+		TSharedRef<FJsonObject> LyricObject = MakeShared<FJsonObject>();
+		LyricObject->SetNumberField(TEXT("start"), LyricLine.StartTime);
+		LyricObject->SetNumberField(TEXT("end"), LyricLine.EndTime);
+		LyricObject->SetStringField(TEXT("text"), LyricLine.Text);
+		LyricValues.Add(MakeShared<FJsonValueObject>(LyricObject));
+	}
+	Summary->SetArrayField(TEXT("lyrics_sample"), LyricValues);
+
+	FString SummaryText;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&SummaryText);
+	FJsonSerializer::Serialize(Summary, Writer);
+
+	return FString::Printf(
+		TEXT("You are the Music Mountain LLM Director.\n")
+		TEXT("Return one valid JSON object only, no markdown.\n")
+		TEXT("Use the audio summary and available lyrics_sample to design a playable spiral mountain journey.\n")
+		TEXT("Preserve section count and names. Keep values playable.\n")
+		TEXT("Output fields: overall_theme, journey_arc, theme, mountain_plan, sections.\n")
+		TEXT("Each section may override mood, energy, terrain, audio_style, visual_motif, gameplay_intent.\n\n")
+		TEXT("Audio summary:\n%s"),
+		*SummaryText);
+}
+
+bool AMusicMountainManager::ApplyClientLLMDirectorJson(const FString& JsonText)
+{
+	TSharedPtr<FJsonObject> RootObject;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+	if (FJsonSerializer::Deserialize(Reader, RootObject) && RootObject.IsValid())
+	{
+		const TArray<TSharedPtr<FJsonValue>>* ContentValues = nullptr;
+		if (RootObject->TryGetArrayField(TEXT("content"), ContentValues) && ContentValues && ContentValues->Num() > 0)
+		{
+			const TSharedPtr<FJsonObject> ContentObject = (*ContentValues)[0]->AsObject();
+			if (ContentObject.IsValid() && ContentObject->HasTypedField<EJson::String>(TEXT("text")))
+			{
+				FString DirectorJsonText;
+				if (!ExtractJsonObjectString(ContentObject->GetStringField(TEXT("text")), DirectorJsonText))
+				{
+					return false;
+				}
+				TSharedPtr<FJsonObject> DirectorObject;
+				const TSharedRef<TJsonReader<>> DirectorReader = TJsonReaderFactory<>::Create(DirectorJsonText);
+				return FJsonSerializer::Deserialize(DirectorReader, DirectorObject) && ApplyDirectorObject(DirectorObject);
+			}
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
+		if (RootObject->TryGetArrayField(TEXT("choices"), Choices) && Choices && Choices->Num() > 0)
+		{
+			const TSharedPtr<FJsonObject> ChoiceObject = (*Choices)[0]->AsObject();
+			const TSharedPtr<FJsonObject>* MessageObject = nullptr;
+			if (ChoiceObject.IsValid() && ChoiceObject->TryGetObjectField(TEXT("message"), MessageObject) && MessageObject && MessageObject->IsValid())
+			{
+				const FString Content = (*MessageObject)->GetStringField(TEXT("content"));
+				FString DirectorJsonText;
+				if (!ExtractJsonObjectString(Content, DirectorJsonText))
+				{
+					return false;
+				}
+				TSharedPtr<FJsonObject> DirectorObject;
+				const TSharedRef<TJsonReader<>> DirectorReader = TJsonReaderFactory<>::Create(DirectorJsonText);
+				return FJsonSerializer::Deserialize(DirectorReader, DirectorObject) && ApplyDirectorObject(DirectorObject);
+			}
+		}
+
+		return ApplyDirectorObject(RootObject);
+	}
+
+	FString ExtractedJsonText;
+	if (!ExtractJsonObjectString(JsonText, ExtractedJsonText))
+	{
+		return false;
+	}
+	TSharedPtr<FJsonObject> DirectorObject;
+	const TSharedRef<TJsonReader<>> ExtractedReader = TJsonReaderFactory<>::Create(ExtractedJsonText);
+	return FJsonSerializer::Deserialize(ExtractedReader, DirectorObject) && ApplyDirectorObject(DirectorObject);
+}
+
+bool AMusicMountainManager::ApplyDirectorObject(const TSharedPtr<FJsonObject>& DirectorObject)
+{
+	if (!DirectorObject.IsValid())
+	{
+		return false;
+	}
+
+	if (DirectorObject->HasTypedField<EJson::String>(TEXT("theme")))
+	{
+		Theme = DirectorObject->GetStringField(TEXT("theme"));
+	}
+	else if (DirectorObject->HasTypedField<EJson::String>(TEXT("overall_theme")))
+	{
+		Theme = DirectorObject->GetStringField(TEXT("overall_theme"));
+	}
+
+	const TSharedPtr<FJsonObject>* MountainPlan = nullptr;
+	if (DirectorObject->TryGetObjectField(TEXT("mountain_plan"), MountainPlan) && MountainPlan && MountainPlan->IsValid())
+	{
+		ApplyDirectorMountainPlan(*MountainPlan);
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* DirectorSections = nullptr;
+	if (DirectorObject->TryGetArrayField(TEXT("sections"), DirectorSections) && DirectorSections)
+	{
+		for (int32 Index = 0; Index < DirectorSections->Num() && Sections.IsValidIndex(Index); ++Index)
+		{
+			const TSharedPtr<FJsonObject> SectionObject = (*DirectorSections)[Index]->AsObject();
+			if (!SectionObject.IsValid())
+			{
+				continue;
+			}
+			FMusicMountainSection& Section = Sections[Index];
+			Section.Mood = SectionObject->HasTypedField<EJson::String>(TEXT("mood")) ? SectionObject->GetStringField(TEXT("mood")) : Section.Mood;
+			Section.Energy = SectionObject->HasTypedField<EJson::Number>(TEXT("energy")) ? FMath::Clamp(static_cast<float>(SectionObject->GetNumberField(TEXT("energy"))), 0.0f, 1.0f) : Section.Energy;
+			Section.Terrain = SectionObject->HasTypedField<EJson::String>(TEXT("terrain")) ? SectionObject->GetStringField(TEXT("terrain")) : Section.Terrain;
+			Section.AudioStyle = SectionObject->HasTypedField<EJson::String>(TEXT("audio_style")) ? SectionObject->GetStringField(TEXT("audio_style")) : Section.AudioStyle;
+			Section.ThemeColor = ResolveThemeColor(Section);
+		}
+	}
+
+	return true;
+}
+
+void AMusicMountainManager::ApplyDirectorMountainPlan(const TSharedPtr<FJsonObject>& MountainPlan)
+{
+	if (!MountainPlan.IsValid())
+	{
+		return;
+	}
+
+	GenerationSeed = MountainPlan->HasTypedField<EJson::Number>(TEXT("generation_seed")) ? MountainPlan->GetIntegerField(TEXT("generation_seed")) : GenerationSeed;
+	MountainHeight = MountainPlan->HasTypedField<EJson::Number>(TEXT("mountain_height")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("mountain_height"))) : MountainHeight;
+	BasePathRadius = MountainPlan->HasTypedField<EJson::Number>(TEXT("base_path_radius")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("base_path_radius"))) : BasePathRadius;
+	TopPathRadius = MountainPlan->HasTypedField<EJson::Number>(TEXT("top_path_radius")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("top_path_radius"))) : TopPathRadius;
+	TotalTurns = MountainPlan->HasTypedField<EJson::Number>(TEXT("total_turns")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("total_turns"))) : TotalTurns;
+	SegmentsPerTurn = MountainPlan->HasTypedField<EJson::Number>(TEXT("segments_per_turn")) ? MountainPlan->GetIntegerField(TEXT("segments_per_turn")) : SegmentsPerTurn;
+	RoadWidth = MountainPlan->HasTypedField<EJson::Number>(TEXT("road_width")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("road_width"))) : RoadWidth;
+	OuterSlopeWidth = MountainPlan->HasTypedField<EJson::Number>(TEXT("outer_slope_width")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("outer_slope_width"))) : OuterSlopeWidth;
+	InnerWallHeight = MountainPlan->HasTypedField<EJson::Number>(TEXT("inner_wall_height")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("inner_wall_height"))) : InnerWallHeight;
+	ElevationGainMultiplier = MountainPlan->HasTypedField<EJson::Number>(TEXT("elevation_gain_multiplier")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("elevation_gain_multiplier"))) : ElevationGainMultiplier;
+	MaxRampPitchDegrees = MountainPlan->HasTypedField<EJson::Number>(TEXT("max_ramp_pitch_degrees")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("max_ramp_pitch_degrees"))) : MaxRampPitchDegrees;
+	VisibilityRangeMeters = MountainPlan->HasTypedField<EJson::Number>(TEXT("visibility_range_meters")) ? static_cast<float>(MountainPlan->GetNumberField(TEXT("visibility_range_meters"))) : VisibilityRangeMeters;
+
+	const TSharedPtr<FJsonObject>* Variation = nullptr;
+	if (MountainPlan->TryGetObjectField(TEXT("variation"), Variation) && Variation && Variation->IsValid())
+	{
+		RadiusVariationStrength = (*Variation)->HasTypedField<EJson::Number>(TEXT("radius")) ? static_cast<float>((*Variation)->GetNumberField(TEXT("radius"))) : RadiusVariationStrength;
+		HeightVariationStrength = (*Variation)->HasTypedField<EJson::Number>(TEXT("height")) ? static_cast<float>((*Variation)->GetNumberField(TEXT("height"))) : HeightVariationStrength;
+		RoadWidthVariationStrength = (*Variation)->HasTypedField<EJson::Number>(TEXT("road_width")) ? static_cast<float>((*Variation)->GetNumberField(TEXT("road_width"))) : RoadWidthVariationStrength;
+		CoreVariationStrength = (*Variation)->HasTypedField<EJson::Number>(TEXT("core")) ? static_cast<float>((*Variation)->GetNumberField(TEXT("core"))) : CoreVariationStrength;
+	}
+}
+
+bool AMusicMountainManager::ExtractJsonObjectString(const FString& RawText, FString& OutJsonText)
+{
+	int32 StartIndex = INDEX_NONE;
+	int32 EndIndex = INDEX_NONE;
+	if (RawText.FindChar(TEXT('{'), StartIndex) && RawText.FindLastChar(TEXT('}'), EndIndex) && EndIndex > StartIndex)
+	{
+		OutJsonText = RawText.Mid(StartIndex, EndIndex - StartIndex + 1);
+		return true;
+	}
+	return false;
+}
+
+const FMusicMountainLyricLine* AMusicMountainManager::FindCurrentLyricLine() const
+{
+	const float PlaybackSeconds = GetMusicPlaybackSeconds();
+	for (const FMusicMountainLyricLine& LyricLine : Lyrics)
+	{
+		if (PlaybackSeconds >= LyricLine.StartTime && PlaybackSeconds <= LyricLine.EndTime)
+		{
+			return &LyricLine;
+		}
+	}
+	return nullptr;
+}
+
+float AMusicMountainManager::GetMusicPlaybackSeconds() const
+{
+	if (MusicComponent)
+	{
+		return MusicPlaybackSeconds;
+	}
+	return GetElapsedSeconds();
+}
+
 void AMusicMountainManager::ShowSectionMessage(const FMusicMountainSection& Section)
 {
 	if (!GEngine)
@@ -1213,5 +2071,6 @@ void AMusicMountainManager::HandleMusicFinished()
 	if (bLoopMusic && !bMusicPaused && ActiveMusic && MusicComponent)
 	{
 		MusicComponent->Play(0.0f);
+		MusicPlaybackSeconds = 0.0f;
 	}
 }

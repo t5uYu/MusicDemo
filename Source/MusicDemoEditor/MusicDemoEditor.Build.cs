@@ -18,7 +18,8 @@ public class MusicDemoEditor : ModuleRules
 			"DesktopPlatform",
 			"Projects",
 			"AssetTools",
-			"Json"
+			"Json",
+			"DeveloperSettings"
 		});
 	}
 }
